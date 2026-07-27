@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
@@ -13,6 +14,26 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs"
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/joho/godotenv"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+)
+
+var (
+	httpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total de requisicoes HTTP processadas",
+		},
+		[]string{"path", "method", "status"},
+	)
 )
 
 type Donation struct {
@@ -30,8 +51,36 @@ type App struct {
 	SqsQueueURL string
 }
 
+func initTracer() *trace.TracerProvider {
+	ctx := context.Background()
+	exp, err := otlptracehttp.New(ctx, otlptracehttp.WithEndpoint("tempo.monitoring.svc:4318"), otlptracehttp.WithInsecure())
+	if err != nil {
+		log.Printf("Failed to create exporter: %v", err)
+		return nil
+	}
+	res, _ := resource.New(ctx, resource.WithAttributes(semconv.ServiceNameKey.String("donation-service")))
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exp),
+		trace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	return tp
+}
+
+func metricsMiddleware(path string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		httpRequestsTotal.WithLabelValues(path, r.Method, "200").Inc()
+		next(w, r)
+	}
+}
+
 func main() {
 	_ = godotenv.Load()
+
+	tp := initTracer()
+	if tp != nil {
+		defer func() { _ = tp.Shutdown(context.Background()) }()
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -61,8 +110,9 @@ func main() {
 	app := &App{DB: db, SqsSvc: sqsSvc, SqsQueueURL: queueURL}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", app.HealthHandler)
-	mux.HandleFunc("/donations", app.DonationHandler)
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/health", otelhttp.NewHandler(metricsMiddleware("/health", app.HealthHandler), "Health"))
+	mux.Handle("/donations", otelhttp.NewHandler(metricsMiddleware("/donations", app.DonationHandler), "Donations"))
 
 	log.Printf("donation-service rodando na porta %s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -84,8 +134,8 @@ func (a *App) DonationHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		d.Status = "APPROVED" // Simulação de gateway de pagamento
-		err := a.DB.QueryRow(
+		d.Status = "APPROVED"
+		err := a.DB.QueryRowContext(r.Context(),
 			"INSERT INTO donations (ngo_id, amount, donor_name, status) VALUES ($1, $2, $3, $4) RETURNING id, created_at",
 			d.NgoID, d.Amount, d.DonorName, d.Status,
 		).Scan(&d.ID, &d.CreatedAt)
@@ -106,7 +156,7 @@ func (a *App) DonationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
-		rows, err := a.DB.Query("SELECT id, ngo_id, amount, donor_name, status, created_at FROM donations ORDER BY id DESC")
+		rows, err := a.DB.QueryContext(r.Context(), "SELECT id, ngo_id, amount, donor_name, status, created_at FROM donations ORDER BY id DESC")
 		if err != nil {
 			http.Error(w, `{"error":"Erro interno"}`, http.StatusInternalServerError)
 			return
